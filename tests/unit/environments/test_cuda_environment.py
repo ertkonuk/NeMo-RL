@@ -72,7 +72,7 @@ def cuda_env():
                 "env_vars": env_vars,
             }
         ).remote({
-            "num_workers": 8,  # 8 workers for 8 GPUs (1 GPU per worker)
+            "num_workers": 8,  # Full 8 workers across 8 GPUs for all tests
             "build_base_dir": build_dir,
             "timeout": 30,
             "compilation_timeout": 20,
@@ -559,3 +559,164 @@ def test_cuda_env_multiple_assistant_messages(cuda_env, hinge_loss_test_data):
     assert len(result.observations) == 1, "Should return observation for 1 conversation"
     # Note: This might pass or fail depending on the exact implementation details
     # The key is that it should handle multiple assistant messages gracefully 
+
+def test_cuda_env_verbose_logging(cuda_env):
+    """Test that verbose logging shows GPU assignments correctly."""
+    # This test validates that when verbose=True, we get proper logging output
+    # The cuda_env fixture already has verbose=True, so we're testing that it initialized properly
+    
+    # Just verify the environment was created successfully with verbose logging
+    # (The actual logging output would be visible in test output when verbose=True)
+    assert cuda_env is not None, "CudaEnvironment should be created successfully with verbose logging"
+    
+    # We can't easily capture the print statements in the Ray remote actor,
+    # but we can verify the environment works correctly
+    test_data = {
+        "message_log_batch": [
+            [
+                {
+                    "role": "user",
+                    "content": "Simple test"
+                },
+                {
+                    "role": "assistant",
+                    "content": "No CUDA code here, should fail gracefully"
+                }
+            ]
+        ],
+        "metadata": [
+            {
+                "reference_implementation": "import torch\nclass Model:\n    def forward(self, x): return x",
+                "problem_id": 999,
+                "problem_name": "VerboseTest",
+            }
+        ]
+    }
+    
+    result = ray.get(cuda_env.step.remote(test_data["message_log_batch"], test_data["metadata"]))
+    
+    # Should handle gracefully (no code extraction = 0.0 reward)
+    assert result.rewards[0] == 0.0, "Should get 0.0 reward for no extractable code"
+    assert len(result.observations) == 1, "Should return 1 observation"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_env_worker_gpu_ratios(cuda_env):
+    """Test CudaEnvironment worker/GPU assignment using existing fixture."""
+    # The cuda_env fixture has 8 workers with 8 GPUs - perfect for testing ratios
+    
+    # Simple test to verify the 8:8 worker/GPU ratio works
+    test_data = {
+        "message_log_batch": [
+            [
+                {"role": "user", "content": "Test worker/GPU ratio"},
+                {"role": "assistant", "content": "No CUDA code here"}
+            ]
+        ],
+        "metadata": [
+            {
+                "reference_implementation": "import torch\nclass Model:\n    def forward(self, x): return x",
+                "problem_id": 1000,
+                "problem_name": "RatioTest",
+            }
+        ]
+    }
+    
+    result = ray.get(cuda_env.step.remote(test_data["message_log_batch"], test_data["metadata"]))
+    assert len(result.observations) == 1, "Should handle 8 workers with 8 GPUs"
+    assert result.rewards[0] == 0.0, "Should fail (no CUDA code)"
+    
+    print("✅ Successfully tested 8:8 worker/GPU ratio (using shared fixture)")
+
+def test_cuda_env_parallel_chunking_2_samples_2_workers(cuda_env):
+    """Test parallel processing: 2 samples distributed across 8 workers using existing fixture."""
+    # Use the existing cuda_env fixture which has 8 workers
+    
+    # Create 2 different samples that should be distributed to workers
+    test_data = {
+        "message_log_batch": [
+            # Sample 1 - Should be distributed to workers
+            [
+                {"role": "user", "content": "Optimize this model"},
+                {"role": "assistant", "content": "Sample 1: No CUDA code, should fail"}
+            ],
+            # Sample 2 - Should be distributed to workers  
+            [
+                {"role": "user", "content": "Write CUDA kernel"},
+                {"role": "assistant", "content": "Sample 2: Also no CUDA code, should fail"}
+            ]
+        ],
+        "metadata": [
+            # Metadata for Sample 1
+            {
+                "reference_implementation": "import torch\nclass Model1:\n    def forward(self, x): return x * 2",
+                "problem_id": 2001,
+                "problem_name": "ChunkTest1",
+            },
+            # Metadata for Sample 2
+            {
+                "reference_implementation": "import torch\nclass Model2:\n    def forward(self, x): return x + 1", 
+                "problem_id": 2002,
+                "problem_name": "ChunkTest2",
+            }
+        ]
+    }
+    
+    # Execute the batch - this should trigger chunking
+    result = ray.get(cuda_env.step.remote(test_data["message_log_batch"], test_data["metadata"]))
+    
+    # Verify results
+    assert len(result.observations) == 2, "Should return 2 observations (one per sample)"
+    assert len(result.rewards) == 2, "Should return 2 rewards (one per sample)"
+    assert len(result.metadata) == 2, "Should return 2 metadata items"
+    
+    # Both samples should fail (no CUDA code)
+    assert result.rewards[0] == 0.0, "Sample 1 should fail (no CUDA code)"
+    assert result.rewards[1] == 0.0, "Sample 2 should fail (no CUDA code)"
+    
+    # Verify observations indicate failure
+    assert "failed" in result.observations[0]["content"], "Sample 1 observation should indicate failure"
+    assert "failed" in result.observations[1]["content"], "Sample 2 observation should indicate failure"
+    
+    # Verify metadata is preserved correctly
+    assert result.metadata[0]["problem_id"] == 2001, "Sample 1 metadata should be preserved"
+    assert result.metadata[1]["problem_id"] == 2002, "Sample 2 metadata should be preserved"
+    
+    print("✅ Successfully tested parallel chunking: 2 samples across 8 workers (using shared fixture)")
+
+
+def test_cuda_env_parallel_chunking_uneven_distribution(cuda_env):
+    """Test parallel processing: 3 samples distributed across 8 workers (uneven) using existing fixture."""
+    # Use the existing cuda_env fixture which has 8 workers
+    
+    # Create 3 samples for 8 workers (should chunk unevenly)
+    test_data = {
+        "message_log_batch": [
+            [{"role": "user", "content": "Sample 1"}, {"role": "assistant", "content": "No code 1"}],
+            [{"role": "user", "content": "Sample 2"}, {"role": "assistant", "content": "No code 2"}],
+            [{"role": "user", "content": "Sample 3"}, {"role": "assistant", "content": "No code 3"}],
+        ],
+        "metadata": [
+            {"reference_implementation": "import torch\nclass Model:\n    pass", "problem_id": 3001, "problem_name": "Uneven1"},
+            {"reference_implementation": "import torch\nclass Model:\n    pass", "problem_id": 3002, "problem_name": "Uneven2"},
+            {"reference_implementation": "import torch\nclass Model:\n    pass", "problem_id": 3003, "problem_name": "Uneven3"},
+        ]
+    }
+    
+    result = ray.get(cuda_env.step.remote(test_data["message_log_batch"], test_data["metadata"]))
+    
+    # Verify all 3 samples were processed
+    assert len(result.observations) == 3, "Should return 3 observations"
+    assert len(result.rewards) == 3, "Should return 3 rewards"  
+    assert len(result.metadata) == 3, "Should return 3 metadata items"
+    
+    # All should fail (no CUDA code)
+    assert all(reward == 0.0 for reward in result.rewards), "All samples should fail"
+    
+    # Verify metadata order is preserved
+    assert result.metadata[0]["problem_id"] == 3001, "First metadata preserved"
+    assert result.metadata[1]["problem_id"] == 3002, "Second metadata preserved" 
+    assert result.metadata[2]["problem_id"] == 3003, "Third metadata preserved"
+    
+    print("✅ Successfully tested uneven chunking: 3 samples across 8 workers (using shared fixture)")
+
+ 

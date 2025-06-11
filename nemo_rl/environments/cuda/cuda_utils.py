@@ -1,5 +1,5 @@
 """
-Complete extraction of KernelBench utilities - no simplifications.
+Complete extraction of KernelBench utilities.
 """
 import re
 import os

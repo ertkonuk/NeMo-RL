@@ -1,5 +1,5 @@
 """
-Complete extraction of KernelBench verification functionality - no simplifications.
+Complete extraction of KernelBench verification functionality.
 """
 import torch
 import torch.nn as nn

@@ -281,17 +281,24 @@ class CudaEnvironment(EnvironmentInterface):
         if not available_gpus:
             raise RuntimeError("No CUDA devices available for CudaEnvironment")
         
+        # Log GPU assignment info if verbose
+        if cfg.get("verbose", False):
+            print(f"CudaEnvironment: Creating {self.num_workers} workers across {len(available_gpus)} GPUs")
+            print(f"Available GPU IDs: {available_gpus}")
+        
         # Create workers with GPU assignment (round-robin)
         self.workers = []
         for i in range(self.num_workers):
             gpu_id = available_gpus[i % len(available_gpus)]
             
+            if cfg.get("verbose", False):
+                print(f"Worker {i} -> GPU {gpu_id}")
+            
             worker = CudaVerifyWorker.options(
-                num_gpus=1,  # Let Ray handle GPU allocation automatically
+                num_gpus=1,  # Each worker requests 1 GPU from Ray
                 runtime_env={
                     "py_executable": CudaVerifyWorker.DEFAULT_PY_EXECUTABLE,
                     "env_vars": {
-                        "OMP_NUM_THREADS": "1",
                         "TORCH_USE_CUDA_DSA": "1",  # Enable device-side assertions
                     }
                 }

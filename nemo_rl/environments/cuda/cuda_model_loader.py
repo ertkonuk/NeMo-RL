@@ -1,5 +1,5 @@
 """
-Complete extraction of KernelBench model loading functionality - no simplifications.
+Complete extraction of KernelBench model loading functionality.
 """
 import torch
 import torch.nn as nn
