@@ -74,6 +74,9 @@ test = [
     "pytest-timeout",
     "pytest-cov",
 ]
+cuda = [
+    "ninja",
+]
 
 
 [tool.black]

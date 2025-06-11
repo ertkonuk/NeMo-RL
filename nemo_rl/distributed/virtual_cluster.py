@@ -48,6 +48,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and ifeval dependencies.
     IFEVAL = "uv run --locked --extra ifeval"
 
+    # Use NeMo-RL direct dependencies and CUDA build tools.
+    CUDA = "uv run --locked --group cuda"
+
 
 @ray.remote
 def _get_node_ip_and_free_port():
