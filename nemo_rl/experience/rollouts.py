@@ -196,6 +196,32 @@ def calculate_rewards(
     )
 
 
+def strip_reasoning_from_assistant_messages(message_log: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> None:
+    """Strip <think>...</think> reasoning traces from assistant messages and re-tokenize.
+    
+    This reduces context length for subsequent turns while preserving the final answers
+    and environment feedback that the model needs.
+    
+    Args:
+        message_log: List of message dictionaries to process in-place
+        tokenizer: Tokenizer for re-tokenizing the stripped content
+    """
+    for msg in message_log:
+        if msg["role"] == "assistant" and "</think>" in msg["content"]:
+            # Extract final response (same logic as environment verification)
+            final_response = msg["content"].split("</think>")[-1].strip()
+            
+            # Update content
+            msg["content"] = final_response
+            
+            # Re-tokenize with same parameters as environment observations
+            msg["token_ids"] = tokenizer(
+                final_response, 
+                return_tensors="pt", 
+                add_special_tokens=False
+            )["input_ids"][0]
+
+
 def run_multi_turn_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -331,6 +357,11 @@ def run_multi_turn_rollout(
 
             # Increment turn count
             sample_turn_counts[global_idx] += 1
+
+        # Strip reasoning traces from assistant messages for context efficiency
+        # This happens AFTER environment feedback is appended, before next turn
+        for i, global_idx in enumerate(active_indices.tolist()):
+            strip_reasoning_from_assistant_messages(current_batch["message_log"][global_idx], tokenizer)
 
         # Determine done samples and update active set
         terminateds = env_output.terminateds.bool()

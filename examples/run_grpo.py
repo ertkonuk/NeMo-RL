@@ -95,6 +95,9 @@ class JsonlinesDataset:
             if m["role"] == "user":
                 # need to be deepcopy to avoid overwriting the original metadata
                 extra_env_info = deepcopy(m["metadata"])
+                # Initialize current_turn for multi-turn code environment
+                if "current_turn" not in extra_env_info:
+                    extra_env_info["current_turn"] = 0
 
         message = self.tokenizer.apply_chat_template(
             single_message,

@@ -28,17 +28,20 @@ from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
 from nemo_rl.environments.utils import chunk_list_to_workers, extract_code
+from nemo_rl.data.interfaces import LLMMessageLogType
 
 
 class CodeEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
     timeout: int = 10  # Timeout for the code execution
+    max_turns: int = 3  # Maximum turns allowed per episode
 
 
 class CodeEnvironmentMetadata(TypedDict):
     unittests: Optional[List[Dict[str, str]]]
     fn_name: Optional[str]
+    current_turn: int  # Track current turn number
 
 
 @ray.remote
@@ -56,7 +59,7 @@ class CodeVerifyWorker:
         pred_responses: List[str],
         metadata: List[CodeEnvironmentMetadata],
         timeout: int,
-    ) -> List[float]:
+    ) -> List[Tuple[float, Dict]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -65,7 +68,7 @@ class CodeVerifyWorker:
             timeout: int. Timeout for code execution.
 
         Returns:
-            List[float]. The rewards for each predicted response.
+            List[Tuple[float, Dict]]. The rewards and execution metadata for each predicted response.
         """
         results = []
         for response, metadata_item in zip(pred_responses, metadata):
@@ -80,10 +83,18 @@ class CodeVerifyWorker:
                     code_str, metadata_item, timeout
                 )
 
-            except Exception as e:
-                ret_score = 0.0
+                # Store the execution metadata along with the score
+                results.append((float(ret_score), execution_metadata or {}))
 
-            results.append(float(ret_score))
+            except Exception as e:
+                # Capture exception information for debugging
+                error_metadata = {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": str(e),
+                }
+                results.append((0.0, error_metadata))
+
         return results
 
 
@@ -103,6 +114,7 @@ class CodeEnvironment(EnvironmentInterface):
             ).remote()
             for _ in range(self.num_workers)
         ]
+        self.runner = CodeRunner(self.workers, cfg)
 
     def shutdown(self):
         # shutdown all workers
@@ -128,58 +140,35 @@ class CodeEnvironment(EnvironmentInterface):
                 - Tensor: Rewards tensor
                 - Tensor: Done flags tensor
         """
-        # Extract the assistant's responses from the message history
-        # Each message list should have at least one assistant response
-        assistant_response_batch = []
-        for conversation in message_log_batch:
-            assistant_responses = [
-                interaction["content"]
-                for interaction in conversation
-                if interaction["role"] == "assistant"
-            ]
-            assistant_response_batch.append("".join(assistant_responses))
-
-        unittests = [prepare_tests(m) for m in metadata]
-
-        chunked_assistant_response_batch = chunk_list_to_workers(
-            assistant_response_batch, self.num_workers
-        )
-        chunked_unittests = chunk_list_to_workers(unittests, self.num_workers)
-
-        # Process each chunk in parallel
-        futures = [
-            self.workers[i].verify.remote(chunk, unittests_chunk, self.cfg["timeout"])
-            for i, (chunk, unittests_chunk) in enumerate(
-                zip(chunked_assistant_response_batch, chunked_unittests)
-            )
+        # Process each turn in the batch
+        results = [
+            self.runner.process_turn(log, meta)
+            for log, meta in zip(message_log_batch, metadata)
         ]
 
-        results = ray.get(futures)
+        # Unpack results and format according to EnvironmentReturn NamedTuple
+        observations = []
+        rewards = []
+        terminateds = []
+        all_stop_strings = []
+        all_next_metadata = []
 
-        # flatten the results
-        results = [item for sublist in results for item in sublist]
-        observations = [
-            {
-                "role": "environment",
-                "content": "Environment: correct"
-                if result
-                else "Environment: incorrect",
-            }
-            for result in results
-        ]
+        for obs, rew, term, stops, meta in results:
+            observations.append(obs)
+            rewards.append(rew)
+            terminateds.append(term)
+            all_stop_strings.append(stops)
+            all_next_metadata.append(meta)
 
-        # create a tensor of rewards and done flags
-        rewards = torch.tensor(results).cpu()
-        done = torch.ones_like(rewards).cpu()
-
-        next_stop_strings = [None] * len(message_log_batch)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        terminated_tensor = torch.tensor(terminateds, dtype=torch.bool)
 
         return EnvironmentReturn(
             observations=observations,
-            metadata=metadata,
-            next_stop_strings=next_stop_strings,
-            rewards=rewards,
-            terminateds=done,
+            metadata=all_next_metadata,
+            next_stop_strings=all_stop_strings,
+            rewards=rewards_tensor,
+            terminateds=terminated_tensor,
         )
 
     def global_post_process_and_metrics(
@@ -205,6 +194,16 @@ class CodeEnvironment(EnvironmentInterface):
         else:
             correct_solution_generation_lengths = 0
 
+        # Calculate average turns per prompt from metadata
+        turns_per_prompt = []
+        for extra_env_info in batch["extra_env_info"]:
+            if extra_env_info and "current_turn" in extra_env_info:
+                turns_per_prompt.append(extra_env_info["current_turn"])
+            else:
+                turns_per_prompt.append(1)  # Default to 1 turn if no data
+        
+        avg_turns_per_prompt = sum(turns_per_prompt) / len(turns_per_prompt) if turns_per_prompt else 1.0
+
         metrics = {
             # "table": table, TODO @sahilj WIP
             "accuracy": batch["rewards"].mean().item(),
@@ -216,6 +215,136 @@ class CodeEnvironment(EnvironmentInterface):
             "generation_lengths": batch["generation_lengths"].float().mean().item(),
             "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
             "correct_solution_generation_lengths": correct_solution_generation_lengths,
+            "average_turns_per_prompt": avg_turns_per_prompt,
         }
 
         return batch, metrics
+
+
+class CodeRunner:
+    """Handles the turn-by-turn logic for the code environment."""
+    
+    def __init__(self, workers: List, cfg: CodeEnvConfig):
+        self.workers = workers
+        self.timeout = cfg["timeout"]
+        self.max_turns = cfg["max_turns"]
+        self.num_workers = len(workers)
+
+    def _format_error_feedback(self, execution_metadata: Dict, current_turn: int, score: float) -> str:
+        """Format detailed error feedback for the model."""
+        # Only treat as correct if score > 0 AND no error metadata
+        if score > 0 and (not execution_metadata or execution_metadata == {}):
+            return "<environment>\nYour solution is correct! Well done.\n</environment>"
+        
+        feedback_parts = [f"<environment>\nTurn {current_turn} failed."]
+        
+        # Handle compilation errors
+        if "error" in execution_metadata:
+            error_msg = execution_metadata["error"]
+            feedback_parts.append(f"\nCompilation/Runtime Error:")
+            feedback_parts.append(f"{error_msg}")
+            
+        if "traceback" in execution_metadata:
+            traceback_msg = execution_metadata["traceback"]
+            feedback_parts.append(f"\nDetailed traceback:")
+            feedback_parts.append(f"{traceback_msg}")
+            
+        # Handle wrong answer cases
+        if "error_message" in execution_metadata and execution_metadata["error_message"] == "Wrong Answer":
+            feedback_parts.append(f"\nYour code executed but produced incorrect output:")
+            
+            if "inputs" in execution_metadata:
+                feedback_parts.append(f"Input: {execution_metadata['inputs']}")
+            if "expected" in execution_metadata:
+                feedback_parts.append(f"Expected output: {execution_metadata['expected']}")
+            if "output" in execution_metadata:
+                feedback_parts.append(f"Your output: {execution_metadata['output']}")
+        
+        # If no specific error info but score is 0, provide generic feedback
+        if score == 0 and not any(key in execution_metadata for key in ["error", "traceback", "error_message"]):
+            feedback_parts.append(f"\nYour code did not produce the expected output.")
+            # Try to show any available details
+            if execution_metadata:
+                feedback_parts.append(f"Debug info: {execution_metadata}")
+                    
+        # Add general guidance
+        feedback_parts.append(f"\nPlease analyze the feedback and fix your code.")
+        feedback_parts.append("</environment>")
+        
+        return "\n".join(feedback_parts)
+
+    def process_turn(
+        self,
+        message_log: LLMMessageLogType,
+        metadata: CodeEnvironmentMetadata,
+    ) -> Tuple[
+        Dict[str, str],
+        float,
+        bool,
+        Optional[List[str]],
+        Optional[CodeEnvironmentMetadata],
+    ]:
+        """Processes a single turn for the code environment."""
+        
+        # Check if we've exceeded max turns
+        current_turn = metadata.get("current_turn", 0) + 1
+        max_turns = self.max_turns
+        
+        if current_turn > max_turns:
+            return (
+                {"role": "environment", "content": "<environment>\nMaximum turns reached. Episode terminated.\n</environment>"},
+                0.0,
+                True,  # Terminate episode
+                None,
+                None,
+            )
+        
+        # Extract the assistant's response from the message history
+        assistant_responses = [
+            interaction["content"]
+            for interaction in message_log
+            if interaction["role"] == "assistant"
+        ]
+        assistant_response = "".join(assistant_responses)
+        
+        if not assistant_response.strip():
+            return (
+                {"role": "environment", "content": "<environment>\nNo code provided. Please provide a solution.\n</environment>"},
+                0.0,
+                False,
+                None,
+                metadata,
+            )
+        
+        # Prepare the test case
+        unittest_data = prepare_tests(metadata)
+        
+        # Run verification
+        try:
+            score, execution_metadata = ray.get(
+                self.workers[0].verify.remote([assistant_response], [unittest_data], self.timeout)
+            )[0]
+        except Exception as e:
+            execution_metadata = {
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+            score = 0.0
+        
+        # Create feedback
+        feedback = self._format_error_feedback(execution_metadata, current_turn, score)
+        observation = {"role": "environment", "content": feedback}
+        
+        # Determine if episode should terminate
+        is_correct = score > 0
+        is_terminated = is_correct
+        
+        # Update metadata for next turn
+        if not is_terminated:
+            new_metadata = metadata.copy()
+            new_metadata["current_turn"] = current_turn
+            
+            return (observation, score, is_terminated, None, new_metadata)
+        else:
+            # Episode terminated successfully
+            return (observation, score, is_terminated, None, None)

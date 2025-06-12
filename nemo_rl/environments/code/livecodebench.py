@@ -78,10 +78,15 @@ def compute_score(solution, test_cases, timeout=5, debug=False, continuous=False
             res, metadata = check_correctness(
                 in_outs=test_cases, generation=solution, timeout=timeout, debug=debug
             )
-            metadata = dict(enumerate(metadata))[0]
+            # Extract metadata properly - it's a list from multiprocessing.Manager
+            if metadata and len(metadata) > 0:
+                first_metadata = metadata[0]  # Get first metadata entry
+            else:
+                first_metadata = {}
+                
             success = all(map(lambda x: x is True, res))
-            if success:
-                return success, metadata
+            # Always return the metadata whether success or failure
+            return success, first_metadata
         except Exception:
             pass
 
