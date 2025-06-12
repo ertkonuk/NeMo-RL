@@ -607,6 +607,12 @@ class Logger(LoggerInterface):
                 for key, value in sample.items():
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
+                    # Handle reasoning summaries specifically
+                    elif key == "reasoning_summaries" and isinstance(value, list):
+                        # Ensure reasoning summaries are properly serialized
+                        # Keep as is - already a list structure
+                        pass
+                
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
 
         print(f"Logged data to {filepath}")

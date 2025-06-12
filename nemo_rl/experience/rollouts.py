@@ -15,19 +15,22 @@
 # Generate rollouts for arbitrary environments
 # Supports multi-turn rollouts and many simultaneous environments (E.g. you can train on math, code, multi-turn games and more at once)
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 import ray
 import torch
+import re
 from transformers import AutoTokenizer
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
+    LLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
+    message_log_to_flat_messages,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -37,6 +40,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
+    GenerationOutputSpec,
 )
 
 
@@ -196,30 +200,169 @@ def calculate_rewards(
     )
 
 
-def strip_reasoning_from_assistant_messages(message_log: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> None:
-    """Strip <think>...</think> reasoning traces from assistant messages and re-tokenize.
-    
-    This reduces context length for subsequent turns while preserving the final answers
-    and environment feedback that the model needs.
+def extract_reasoning_traces(message_logs: List[List[Dict[str, Any]]]) -> List[Optional[str]]:
+    """Extract reasoning traces from a batch of message logs.
     
     Args:
-        message_log: List of message dictionaries to process in-place
-        tokenizer: Tokenizer for re-tokenizing the stripped content
+        message_logs: List of message logs, each containing assistant messages
+        
+    Returns:
+        List of extracted reasoning traces, or None if no reasoning trace found
     """
-    for msg in message_log:
-        if msg["role"] == "assistant" and "</think>" in msg["content"]:
-            # Extract final response (same logic as environment verification)
-            final_response = msg["content"].split("</think>")[-1].strip()
-            
-            # Update content
-            msg["content"] = final_response
-            
-            # Re-tokenize with same parameters as environment observations
-            msg["token_ids"] = tokenizer(
-                final_response, 
-                return_tensors="pt", 
-                add_special_tokens=False
-            )["input_ids"][0]
+    reasoning_traces = []
+    
+    for message_log in message_logs:
+        # Find the last assistant message in each log
+        for msg in reversed(message_log):
+            if msg["role"] == "assistant":
+                if "<think>" in msg["content"] and "</think>" in msg["content"]:
+                    reasoning_match = re.search(r"<think>(.*?)</think>", msg["content"], re.DOTALL)
+                    if reasoning_match:
+                        reasoning = reasoning_match.group(1).strip()
+                        reasoning_traces.append(reasoning)
+                    else:
+                        reasoning_traces.append(None)
+                else:
+                    reasoning_traces.append(None)
+                break
+        else:
+            # No assistant message found
+            reasoning_traces.append(None)
+    
+    return reasoning_traces
+
+
+def generate_reasoning_summaries(
+    reasoning_traces: List[Optional[str]],
+    policy_generation: GenerationInterface,
+    tokenizer: AutoTokenizer
+) -> List[Optional[str]]:
+    """Generate summaries for a batch of reasoning traces.
+    
+    Args:
+        reasoning_traces: List of reasoning traces to summarize
+        policy_generation: Generation interface for creating summaries
+        tokenizer: Tokenizer for processing text
+        
+    Returns:
+        List of reasoning summaries
+    """
+    # Filter out None values and keep track of indices
+    valid_indices = []
+    valid_traces = []
+    
+    for i, trace in enumerate(reasoning_traces):
+        if trace is not None:
+            valid_indices.append(i)
+            valid_traces.append(trace)
+    
+    if not valid_traces:
+        return [None] * len(reasoning_traces)
+    
+    # Create prompts for each valid reasoning trace
+    summary_prompts = [
+        f"""Summarize the following reasoning process in 2-3 sentences, maintaining the same style and tone. Only output the summary, nothing else:
+
+{trace}
+
+Summary:"""
+        for trace in valid_traces
+    ]
+    
+    # Tokenize all prompts
+    tokenized_prompts = tokenizer(
+        summary_prompts,
+        padding=True,
+        return_tensors="pt",
+        add_special_tokens=True
+    )
+    
+    input_ids = tokenized_prompts["input_ids"].to(policy_generation.device)
+    attention_mask = tokenized_prompts["attention_mask"].to(policy_generation.device)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    
+    # Generate summaries in batch
+    generation_input_data = BatchedDataDict[GenerationDatumSpec](
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "stop_strings": [None] * len(valid_traces),
+        }
+    )
+    
+    generation_outputs = policy_generation.generate(generation_input_data, greedy=True)
+    
+    # Extract generated summaries
+    output_ids = generation_outputs["output_ids"]
+    unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
+    
+    summaries = []
+    for i, (output, input_length, total_length) in enumerate(
+        zip(output_ids, input_lengths, unpadded_sequence_lengths)
+    ):
+        summary_ids = output[input_length:total_length]
+        summary = tokenizer.decode(summary_ids, skip_special_tokens=True).strip()
+        summaries.append(summary)
+    
+    # Map summaries back to original indices
+    result = [None] * len(reasoning_traces)
+    for i, summary in zip(valid_indices, summaries):
+        result[i] = summary
+    
+    return result
+
+
+def strip_reasoning_from_assistant_messages(
+    message_logs: List[List[Dict[str, Any]]],
+    tokenizer: AutoTokenizer,
+    policy_generation: Optional[GenerationInterface] = None
+) -> List[Optional[str]]:
+    """Strip <think>...</think> reasoning traces from assistant messages and re-tokenize.
+    
+    Also generates summaries of reasoning if policy_generation is provided.
+    
+    Args:
+        message_logs: List of message logs to process in-place
+        tokenizer: Tokenizer for re-tokenizing the stripped content
+        policy_generation: Optional generation interface for creating summaries
+        
+    Returns:
+        List of reasoning summaries for each message log
+    """
+    reasoning_summaries = [None] * len(message_logs)
+    
+    # First, extract all reasoning traces
+    if policy_generation is not None:
+        reasoning_traces = extract_reasoning_traces(message_logs)
+        
+        # Generate summaries in batch
+        reasoning_summaries = generate_reasoning_summaries(
+            reasoning_traces, policy_generation, tokenizer
+        )
+    
+    # Now strip reasoning from all message logs
+    for message_log in message_logs:
+        for msg in message_log:
+            if msg["role"] == "assistant" and "</think>" in msg["content"]:
+                # Extract final response
+                final_response = msg["content"].split("</think>")[-1].strip()
+                
+                # Update content
+                msg["content"] = final_response
+                
+                # Re-tokenize with same parameters as environment observations
+                msg["token_ids"] = tokenizer(
+                    final_response, 
+                    return_tensors="pt", 
+                    add_special_tokens=False
+                )["input_ids"][0]
+                if len(msg["token_ids"]) == 0:
+                    # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
+                    # which causes `_validate_tensor_consistency` to fail. To fix this, we convert the
+                    # empty tensor to int64.
+                    msg["token_ids"] = msg["token_ids"].to(torch.int64)
+    
+    return reasoning_summaries
 
 
 def run_multi_turn_rollout(
@@ -320,16 +463,47 @@ def run_multi_turn_rollout(
 
         total_rewards[active_indices] += env_output.rewards
 
+        # For turns after the first one, generate summaries of reasoning traces
+        if turn > 0:
+            # Extract reasoning traces from the current turn's responses
+            reasoning_traces = extract_reasoning_traces(active_batch["message_log"])
+            
+            # Generate summaries for the reasoning traces
+            reasoning_summaries = generate_reasoning_summaries(
+                reasoning_traces, policy_generation, tokenizer
+            )
+            
+            # Replace original reasoning traces with summaries in the message log
+            for i, message_log in enumerate(active_batch["message_log"]):
+                for msg in message_log:
+                    if msg["role"] == "assistant" and "</think>" in msg["content"]:
+                        if reasoning_summaries[i]:
+                            # Replace original reasoning with summary
+                            summary_content = f"<think>\n{reasoning_summaries[i]}\n</think>\n"
+                            final_response = msg["content"].split("</think>")[-1].strip()
+                            msg["content"] = summary_content + final_response
+                            
+                            # Re-tokenize with updated content
+                            msg["token_ids"] = tokenizer(
+                                msg["content"], 
+                                return_tensors="pt", 
+                                add_special_tokens=False
+                            )["input_ids"][0]
+                            if len(msg["token_ids"]) == 0:
+                                msg["token_ids"] = msg["token_ids"].to(torch.int64)
+
         # Update message log for ALL active samples with env observation
-        # This must happen BEFORE filtering based on done flags
+        # This must happen AFTER reasoning processing but BEFORE filtering based on done flags
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
+            
             # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
+            if len(tokenized_obs) == 0:
+                tokenized_obs = tokenized_obs.to(torch.int64)
 
             # check if new message overflows max_seq_len
             if (
@@ -357,11 +531,6 @@ def run_multi_turn_rollout(
 
             # Increment turn count
             sample_turn_counts[global_idx] += 1
-
-        # Strip reasoning traces from assistant messages for context efficiency
-        # This happens AFTER environment feedback is appended, before next turn
-        for i, global_idx in enumerate(active_indices.tolist()):
-            strip_reasoning_from_assistant_messages(current_batch["message_log"][global_idx], tokenizer)
 
         # Determine done samples and update active set
         terminateds = env_output.terminateds.bool()
