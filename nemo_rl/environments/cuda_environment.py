@@ -1,8 +1,10 @@
 import logging
 import os
 import ray
+import shutil
 import torch
 import time
+import hashlib
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -21,33 +23,47 @@ from nemo_rl.environments.cuda.cuda_model_loader import build_compile_cache
 from nemo_rl.environments.cuda.cuda_utils import extract_first_code, extract_last_code
 
 class CudaEnvConfig(TypedDict):
+    # Core Ray/Cluster settings
     num_workers: int
-    build_base_dir: str  # Base directory for CUDA compilation artifacts
+    cuda_device_ids: Optional[List[int]]  # Specific CUDA devices to use
+    gpu_memory_fraction: Optional[float]  # GPU memory fraction per worker
+
+    # Build/Storage related settings
+    cuda_build_cache: Optional[str] = "cuda_build_cache"  # Base directory for CUDA compilation artifacts
+
+    # Verification settings
     timeout: int  # Timeout for individual kernel verification
     compilation_timeout: Optional[int]  # Separate timeout for compilation phase
-    stop_strings: Optional[List[str]]  # Default stop strings for this env
-    gpu_arch: Optional[str]  # CUDA architecture (e.g., "8.0", "7.5")
-    gpu_memory_fraction: Optional[float]  # GPU memory fraction per worker
+    gpu_arch: Optional[str]  =  "Hopper" # CUDA architecture (e.g., "Hopper", "Ampere", "Ada")
     measure_performance: Optional[bool]  # Whether to benchmark correct kernels
     num_correctness_trials: Optional[int]  # Number of correctness trials per kernel
     num_performance_trials: Optional[int]  # Number of performance trials per kernel
-    verbose: Optional[bool]  # Verbose compilation and execution logging
-    cleanup_build_dirs: Optional[bool]  # Whether to cleanup build dirs after verification
     max_concurrent_compilations: Optional[int]  # Limit concurrent compilations
-    retry_compilation_failures: Optional[bool]  # Whether to retry compilation failures
-    cuda_device_ids: Optional[List[int]]  # Specific CUDA devices to use
+
+    # Misc environmentsettings
+    stop_strings: Optional[List[str]] = None  # Default stop strings for this env
+    verbose: Optional[bool]  # Verbose compilation and execution logging
+
 
 class CudaEnvironmentMetadata(TypedDict):
     reference_implementation: str  # Original PyTorch model source code
-    problem_id: int  # Unique problem identifier
-    problem_name: str  # Human-readable problem name
-    problem_description: Optional[str]  # Problem description
     num_correctness_trials: Optional[int]  # Override default number of trials
     measure_performance: Optional[bool]  # Override default performance measurement
-    expected_speedup: Optional[float]  # Expected performance improvement
-    gpu_memory_requirements: Optional[int]  # Minimum GPU memory required (MB)
-    compilation_flags: Optional[List[str]]  # Custom compilation flags
     reference_baseline_time: Optional[float]  # Reference implementation timing
+
+def prepare_cuda_build_info(metadata, conversation_content, sample_index):
+    """Preprocess metadata to add unique build directory info."""
+    # Create unique build identifier
+    content_hash = hashlib.md5(str(conversation_content).encode()).hexdigest()[:8] 
+    timestamp = int(time.time() * 1000000)  # microseconds
+    unique_build_id = f"sample_{sample_index}_{content_hash}_{timestamp}"
+    
+    # Enrich metadata with build info
+    build_metadata = dict(metadata)  # Copy original
+    build_metadata["build_unique_id"] = unique_build_id
+    build_metadata["sample_index"] = sample_index
+    
+    return build_metadata
 
 @ray.remote
 class CudaVerifyWorker:
@@ -56,7 +72,8 @@ class CudaVerifyWorker:
     def __init__(self, 
                  worker_id: int,
                  gpu_id: int,
-                 verbose: bool = False,
+                 cuda_build_cache: str,
+                 verbose: bool = True,
                  gpu_memory_fraction: Optional[float] = None):
         self.worker_id = worker_id
         self.gpu_id = gpu_id
@@ -65,9 +82,16 @@ class CudaVerifyWorker:
         logging.getLogger("cuda_verify").setLevel(
             logging.INFO if verbose else logging.WARNING
         )
-        
+
+        # Create worker's unique base directory
+        worker_timestamp = int(time.time() * 1000000)  # Use already imported time
+        self.base_dir = os.path.join(
+            cuda_build_cache,
+            f"worker_{worker_id}_{worker_timestamp}"
+        )
+        os.makedirs(self.base_dir, exist_ok=True)
+
         # Debug: Check environment variables in worker
-        import os
         if self.verbose:
             print(f"Worker {worker_id} CUDA_VISIBLE_DEVICES before: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         
@@ -113,13 +137,24 @@ class CudaVerifyWorker:
         # Import verification functions
         self.verify_func = eval_kernel_against_ref
         self.compile_func = build_compile_cache
+    
+    def _cleanup_build_dir(self, build_dir: str) -> None:
+        """Clean up build directory after verification (KernelBench style)."""
+        try:
+            if os.path.exists(build_dir):
+                shutil.rmtree(build_dir)
+                if self.verbose:
+                    print(f"Worker {self.worker_id}: Cleaned up build directory: {build_dir}")
+        except Exception as e:
+            if self.verbose:
+                print(f"Worker {self.worker_id}: Warning - Failed to cleanup {build_dir}: {e}")
+            # Don't raise - cleanup failure shouldn't break training
 
     def verify(
         self,
         pred_responses: List[str],
         metadata: List[CudaEnvironmentMetadata],
         timeout: int,
-        build_base_dir: str,
         compilation_timeout: Optional[int] = None,
         measure_performance: bool = False,
         num_correctness_trials: int = 1,
@@ -131,7 +166,6 @@ class CudaVerifyWorker:
             pred_responses: List[str]. The predicted responses from the LLM.
             metadata: List[CudaEnvironmentMetadata]. The metadata containing reference implementations.
             timeout: int. Timeout for overall verification.
-            build_base_dir: str. Base directory for build artifacts.
             compilation_timeout: Optional[int]. Timeout for compilation phase.
             measure_performance: bool. Whether to measure performance of correct kernels.
             num_correctness_trials: int. Number of correctness trials per kernel.
@@ -158,12 +192,9 @@ class CudaVerifyWorker:
                     results.append(0.0)
                     continue
 
-                # Create unique build directory for this worker and sample
-                build_dir = os.path.join(
-                    build_base_dir, 
-                    f"worker_{self.worker_id}", 
-                    f"sample_{i}_{int(time.time())}"
-                )
+                # Create unique build directory using the preprocessed build ID
+                build_unique_id = metadata_item.get("build_unique_id", f"sample_{i}_{int(time.time())}")
+                build_dir = os.path.join(self.base_dir, build_unique_id)
                 os.makedirs(build_dir, exist_ok=True)
 
                 # Get reference implementation
@@ -224,13 +255,16 @@ class CudaVerifyWorker:
                     if self.verbose:
                         print(f"Worker {self.worker_id}: Sample {i} FAILED - compiled: {kernel_result.compiled}, correct: {kernel_result.correctness}")
 
-                # Clean up build directory if configured
-                # (Could be made configurable via CudaEnvConfig)
+                # Always clean up build directory after verification
+                self._cleanup_build_dir(build_dir)
                 
             except Exception as e:
                 if self.verbose:
                     print(f"Worker {self.worker_id}: Error verifying sample {i}: {e}")
                 results.append(0.0)
+                # Clean up build directory even on exception
+                if 'build_dir' in locals():
+                    self._cleanup_build_dir(build_dir)
 
         return results
 
@@ -256,7 +290,7 @@ class CudaEnvironment(EnvironmentInterface):
     def __init__(self, cfg: CudaEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        self.build_base_dir = cfg["build_base_dir"]
+        self.cuda_build_cache = cfg["cuda_build_cache"]
         
         # Set up GPU architecture if specified
         if cfg.get("gpu_arch"):
@@ -305,13 +339,14 @@ class CudaEnvironment(EnvironmentInterface):
             ).remote(
                 worker_id=i,
                 gpu_id=gpu_id,
+                cuda_build_cache=self.cuda_build_cache,
                 verbose=cfg.get("verbose", False),
                 gpu_memory_fraction=cfg.get("gpu_memory_fraction")
             )
             self.workers.append(worker)
 
         # Create base build directory
-        os.makedirs(self.build_base_dir, exist_ok=True)
+        os.makedirs(self.cuda_build_cache, exist_ok=True)
 
     def shutdown(self):
         """Shutdown all CUDA workers."""
@@ -343,17 +378,19 @@ class CudaEnvironment(EnvironmentInterface):
             ]
             assistant_response_batch.append("".join(assistant_responses))
 
-        # Create unique build directory for this batch
-        batch_build_dir = os.path.join(
-            self.build_base_dir, 
-            f"batch_{int(time.time() * 1000)}"  # Use milliseconds for uniqueness
-        )
+        # No need for batch build directory since each worker has its own base directory
 
         # Chunk work across workers
         chunked_assistant_response_batch = chunk_list_to_workers(
             assistant_response_batch, self.num_workers
         )
-        chunked_metadata = chunk_list_to_workers(metadata, self.num_workers)
+
+        # Preprocess metadata just like code_environment does
+        build_metadata = [
+            prepare_cuda_build_info(m, conversation, i) 
+            for i, (m, conversation) in enumerate(zip(metadata, message_log_batch))
+        ]
+        chunked_metadata = chunk_list_to_workers(build_metadata, self.num_workers)
 
         # Process each chunk in parallel
         futures = [
@@ -361,7 +398,6 @@ class CudaEnvironment(EnvironmentInterface):
                 pred_responses=chunk, 
                 metadata=metadata_chunk, 
                 timeout=self.cfg["timeout"],
-                build_base_dir=batch_build_dir,
                 compilation_timeout=self.cfg.get("compilation_timeout"),
                 measure_performance=self.cfg.get("measure_performance", False),
                 num_correctness_trials=self.cfg.get("num_correctness_trials", 1),

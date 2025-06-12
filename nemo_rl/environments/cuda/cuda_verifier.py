@@ -341,7 +341,7 @@ def eval_kernel_against_ref(
     context = {}
 
     if verbose:
-        print(f"[Eval] Start Evalulation! on device: {device}")
+        print(f"[Eval] Start Evaluation! on device: {device}")
         print("[Eval] Loading Original Model")
 
     Model, get_init_inputs, get_inputs = load_original_model_and_inputs(

@@ -73,9 +73,10 @@ def cuda_env():
             }
         ).remote({
             "num_workers": 8,  # Full 8 workers across 8 GPUs for all tests
-            "build_base_dir": build_dir,
+            "cuda_build_cache": build_dir,
             "timeout": 30,
             "compilation_timeout": 20,
+            "gpu_arch": "Hopper",  # Explicitly set GPU architecture for tests
             "verbose": True,
             "measure_performance": False,
             "num_correctness_trials": 1,
