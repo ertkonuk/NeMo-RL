@@ -421,6 +421,35 @@ def run_multi_turn_rollout(
         active_batch = current_batch.select_indices(active_indices)
         active_stop_strings = [current_stop_strings[i] for i in active_indices.tolist()]
 
+        # For turns after the first one, generate summaries of reasoning traces
+        if turn > 0:
+            # Extract reasoning traces from the current turn's responses
+            reasoning_traces = extract_reasoning_traces(active_batch["message_log"])
+            
+            # Generate summaries for the reasoning traces
+            reasoning_summaries = generate_reasoning_summaries(
+                reasoning_traces, policy_generation, tokenizer
+            )
+            
+            # Replace original reasoning traces with summaries in the message log
+            for i, message_log in enumerate(active_batch["message_log"]):
+                for msg in message_log:
+                    if msg["role"] == "assistant" and "</think>" in msg["content"]:
+                        if reasoning_summaries[i]:
+                            # Replace original reasoning with summary
+                            summary_content = f"<think>\n{reasoning_summaries[i]}\n</think>\n"
+                            final_response = msg["content"].split("</think>")[-1].strip()
+                            msg["content"] = summary_content + final_response
+                            
+                            # Re-tokenize with updated content
+                            msg["token_ids"] = tokenizer(
+                                msg["content"], 
+                                return_tensors="pt", 
+                                add_special_tokens=False
+                            )["input_ids"][0]
+                            if len(msg["token_ids"]) == 0:
+                                msg["token_ids"] = msg["token_ids"].to(torch.int64)
+
         active_flat_messages: FlatMessagesType
         active_flat_messages, active_input_lengths = (
             batched_message_log_to_flat_message(
@@ -462,35 +491,6 @@ def run_multi_turn_rollout(
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
 
         total_rewards[active_indices] += env_output.rewards
-
-        # For turns after the first one, generate summaries of reasoning traces
-        if turn > 0:
-            # Extract reasoning traces from the current turn's responses
-            reasoning_traces = extract_reasoning_traces(active_batch["message_log"])
-            
-            # Generate summaries for the reasoning traces
-            reasoning_summaries = generate_reasoning_summaries(
-                reasoning_traces, policy_generation, tokenizer
-            )
-            
-            # Replace original reasoning traces with summaries in the message log
-            for i, message_log in enumerate(active_batch["message_log"]):
-                for msg in message_log:
-                    if msg["role"] == "assistant" and "</think>" in msg["content"]:
-                        if reasoning_summaries[i]:
-                            # Replace original reasoning with summary
-                            summary_content = f"<think>\n{reasoning_summaries[i]}\n</think>\n"
-                            final_response = msg["content"].split("</think>")[-1].strip()
-                            msg["content"] = summary_content + final_response
-                            
-                            # Re-tokenize with updated content
-                            msg["token_ids"] = tokenizer(
-                                msg["content"], 
-                                return_tensors="pt", 
-                                add_special_tokens=False
-                            )["input_ids"][0]
-                            if len(msg["token_ids"]) == 0:
-                                msg["token_ids"] = msg["token_ids"].to(torch.int64)
 
         # Update message log for ALL active samples with env observation
         # This must happen AFTER reasoning processing but BEFORE filtering based on done flags
