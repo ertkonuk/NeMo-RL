@@ -282,7 +282,7 @@ Do not include the original reasoning trace in your response. Do not start with 
         summary_prompts,
         padding=True,
         return_tensors="pt",
-        add_special_tokens=True
+        add_special_tokens=False
     )
     
     # Handle different generation interfaces
