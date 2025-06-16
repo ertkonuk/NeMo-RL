@@ -731,7 +731,7 @@ def validate(
                 tokenizer,
                 val_task_to_env,
                 max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                max_rollout_turns=master_config["grpo"]["max_validation_turns"],
                 greedy=False,
             )
             rewards = val_batch["total_reward"]
