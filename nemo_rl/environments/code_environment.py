@@ -36,6 +36,7 @@ class CodeEnvConfig(TypedDict):
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
     timeout: int = 10  # Timeout for the code execution
     max_turns: int = 3  # Maximum turns allowed per episode
+    turn_penalty: float = 0.8  # Multiplier for each additional turn (e.g., 0.8 means 20% penalty per turn)
 
 
 class CodeEnvironmentMetadata(TypedDict):
@@ -228,6 +229,7 @@ class CodeRunner:
         self.workers = workers
         self.timeout = cfg["timeout"]
         self.max_turns = cfg["max_turns"]
+        self.turn_penalty = cfg.get("turn_penalty", 0.8)  # Default to 0.8 if not specified
         self.num_workers = len(workers)
 
     def _format_error_feedback(self, execution_metadata: Dict, current_turn: int, score: float) -> str:
@@ -330,6 +332,13 @@ class CodeRunner:
                 "error_type": type(e).__name__,
             }
             score = 0.0
+        
+        # Apply turn-based reward multiplier if solution is correct
+        if score > 0:
+            # Apply penalty for each turn beyond the first
+            # Turn 1: multiplier = 1.0, Turn 2: multiplier = 0.8, Turn 3: multiplier = 0.64, etc.
+            turn_multiplier = self.turn_penalty ** (current_turn - 1)
+            score = score * turn_multiplier
         
         # Create feedback
         feedback = self._format_error_feedback(execution_metadata, current_turn, score)
