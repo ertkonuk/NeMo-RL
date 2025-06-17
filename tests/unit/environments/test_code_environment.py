@@ -29,13 +29,16 @@ def code_env():
             "py_executable": CodeEnvironment.DEFAULT_PY_EXECUTABLE,
             "env_vars": dict(os.environ),
         }
-    ).remote({"num_workers": 2, "timeout": 10})
+    ).remote({"num_workers": 2, "timeout": 10, "max_turns": 3, "turn_penalty": 0.8})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
     ray.kill(env)
     # Give some time for cleanup
     time.sleep(0.1)
+
+
+
 
 
 @pytest.fixture
@@ -454,8 +457,11 @@ def test_code_env_simple_function(code_env):
     assert result.observations[0]["role"] == "environment", (
         "Observation should be from environment"
     )
-    assert result.observations[0]["content"] == "Environment: correct", (
-        "Response should be correct"
+    assert "<environment>" in result.observations[0]["content"], (
+        "Response should be in new detailed format"
+    )
+    assert "Your solution is correct!" in result.observations[0]["content"], (
+        "Response should indicate success"
     )
 
     # Check rewards and done flags
@@ -493,11 +499,17 @@ def test_code_env_step_mixed(code_env, mixed_test_data):
     assert len(result.observations) == 2, (
         "Should return observations for all 2 messages"
     )
-    assert result.observations[0]["content"] == "Environment: correct", (
-        "First response should be correct"
+    assert "<environment>" in result.observations[0]["content"], (
+        "First response should be in new format"
     )
-    assert result.observations[1]["content"] == "Environment: incorrect", (
-        "Second response should be incorrect"
+    assert "Your solution is correct!" in result.observations[0]["content"], (
+        "First response should indicate success"
+    )
+    assert "<environment>" in result.observations[1]["content"], (
+        "Second response should be in new format"
+    )
+    assert "Turn 1 failed" in result.observations[1]["content"], (
+        "Second response should indicate failure"
     )
 
     assert result.rewards.shape == (2,), "Rewards should be a tensor of shape (2,)"
@@ -563,8 +575,9 @@ def test_code_env_various_batches(code_env, batch_size):
         f"Should return observations for all {batch_size} messages"
     )
     assert all(
-        obs["content"] == "Environment: correct" for obs in result.observations
-    ), "All responses should be correct"
+        "<environment>" in obs["content"] and "Your solution is correct!" in obs["content"]
+        for obs in result.observations
+    ), "All responses should indicate success in new format"
     assert result.rewards.shape == (batch_size,), (
         "Rewards should be a tensor of shape (batch_size,)"
     )
@@ -601,8 +614,11 @@ def test_code_exception_handling(code_env):
     # Program should not crash, should handle exception gracefully
     assert result.rewards.shape == (1,), "Rewards should be a tensor of shape (1,)"
     assert result.rewards[0] == 0.0, "Reward should be 0.0 for failed execution"
-    assert result.observations[0]["content"] == "Environment: incorrect", (
-        "Should return incorrect for failed execution"
+    assert "<environment>" in result.observations[0]["content"], (
+        "Should return response in new format"
+    )
+    assert "Turn 1 failed" in result.observations[0]["content"], (
+        "Should indicate failure in detailed format"
     )
 
 
@@ -635,3 +651,325 @@ def test_code_env_debug(code_env):
     assert result.observations[0]["role"] == "environment"
     assert result.rewards.shape == (1,)
     assert result.rewards[0] in [0.0, 1.0]
+
+
+@pytest.fixture
+def multi_turn_success_test_data():
+    """Test data for a solution that fails first but succeeds on second attempt."""
+    return {
+        "message_log_batch": [
+            [
+                {
+                    "role": "user",
+                    "content": "Write a function that adds two numbers.",
+                },
+                {
+                    "role": "assistant",
+                    "content": """```python
+def add_numbers(a, b):
+    return a - b  # Wrong operation - will fail
+```""",
+                },
+            ]
+        ],
+        "metadata": [
+            {
+                "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+                "fn_name": "add_numbers",
+                "current_turn": 0,  # First turn
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def multi_turn_second_attempt_data():
+    """Test data for the second attempt that should succeed."""
+    return {
+        "message_log_batch": [
+            [
+                {
+                    "role": "user",
+                    "content": "Write a function that adds two numbers.",
+                },
+                {
+                    "role": "assistant",
+                    "content": """```python
+def add_numbers(a, b):
+    return a - b  # Wrong operation - will fail
+```""",
+                },
+                {
+                    "role": "environment",
+                    "content": "<environment>\nTurn 1 failed.\n\nYour code executed but produced incorrect output:\nInput: 2\n3\nExpected output: 5\nYour output: -1\n\nPlease analyze the feedback and fix your code.\n</environment>",
+                },
+                {
+                    "role": "assistant",
+                    "content": """```python
+def add_numbers(a, b):
+    return a + b  # Correct operation
+```""",
+                },
+            ]
+        ],
+        "metadata": [
+            {
+                "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+                "fn_name": "add_numbers",
+                "current_turn": 1,  # Second turn
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def multi_turn_max_turns_data():
+    """Test data for exceeding max turns."""
+    return {
+        "message_log_batch": [
+            [
+                {
+                    "role": "user",
+                    "content": "Write a function that adds two numbers.",
+                },
+                {
+                    "role": "assistant",
+                    "content": """```python
+def add_numbers(a, b):
+    return a - b  # Wrong operation
+```""",
+                },
+            ]
+        ],
+        "metadata": [
+            {
+                "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+                "fn_name": "add_numbers",
+                "current_turn": 3,  # Already at max turns
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def multi_turn_syntax_error_data():
+    """Test data for syntax error with detailed feedback."""
+    return {
+        "message_log_batch": [
+            [
+                {
+                    "role": "user",
+                    "content": "Write a function that adds two numbers.",
+                },
+                {
+                    "role": "assistant",
+                    "content": """```python
+def add_numbers(a, b):
+    return a +  # Syntax error - missing operand
+```""",
+                },
+            ]
+        ],
+        "metadata": [
+            {
+                "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+                "fn_name": "add_numbers",
+                "current_turn": 0,
+            }
+        ],
+    }
+
+
+def test_multi_turn_first_attempt_fails(code_env, multi_turn_success_test_data):
+    """Test that first attempt fails and provides detailed feedback."""
+    result = ray.get(
+        code_env.step.remote(
+            multi_turn_success_test_data["message_log_batch"],
+            multi_turn_success_test_data["metadata"],
+        )
+    )
+
+    # Check that the response indicates failure
+    assert len(result.observations) == 1
+    assert result.observations[0]["role"] == "environment"
+    assert "Turn 1 failed" in result.observations[0]["content"]
+    assert "Expected output: 5" in result.observations[0]["content"]
+    assert "Your output: -1" in result.observations[0]["content"]
+    
+    # Should get 0 reward for failed attempt
+    assert result.rewards[0] == 0.0
+    
+    # Should not terminate on failed attempt
+    assert result.terminateds[0] == False
+    
+    # Metadata should be updated for next turn
+    assert result.metadata[0] is not None
+    assert result.metadata[0]["current_turn"] == 1
+
+
+def test_multi_turn_second_attempt_succeeds(code_env, multi_turn_second_attempt_data):
+    """Test that second attempt succeeds with turn penalty applied."""
+    result = ray.get(
+        code_env.step.remote(
+            multi_turn_second_attempt_data["message_log_batch"],
+            multi_turn_second_attempt_data["metadata"],
+        )
+    )
+
+    # Check that the response indicates success
+    assert len(result.observations) == 1
+    assert result.observations[0]["role"] == "environment"
+    assert "Your solution is correct!" in result.observations[0]["content"]
+    
+    # Should get reduced reward due to turn penalty (0.8 for second turn)
+    expected_reward = 1.0 * 0.8  # turn_penalty = 0.8
+    assert abs(result.rewards[0] - expected_reward) < 1e-6
+    
+    # Should terminate on successful attempt
+    assert result.terminateds[0] == True
+    
+    # Metadata should be None for terminated episode
+    assert result.metadata[0] is None
+
+
+def test_multi_turn_max_turns_exceeded(code_env, multi_turn_max_turns_data):
+    """Test that exceeding max turns terminates the episode."""
+    result = ray.get(
+        code_env.step.remote(
+            multi_turn_max_turns_data["message_log_batch"],
+            multi_turn_max_turns_data["metadata"],
+        )
+    )
+
+    # Check that the response indicates max turns reached
+    assert len(result.observations) == 1
+    assert result.observations[0]["role"] == "environment"
+    assert "Maximum turns reached" in result.observations[0]["content"]
+    
+    # Should get 0 reward for exceeding max turns
+    assert result.rewards[0] == 0.0
+    
+    # Should terminate
+    assert result.terminateds[0] == True
+    
+    # Metadata should be None for terminated episode
+    assert result.metadata[0] is None
+
+
+def test_multi_turn_syntax_error_feedback(code_env, multi_turn_syntax_error_data):
+    """Test that syntax errors provide detailed feedback."""
+    result = ray.get(
+        code_env.step.remote(
+            multi_turn_syntax_error_data["message_log_batch"],
+            multi_turn_syntax_error_data["metadata"],
+        )
+    )
+
+    # Check that the response provides detailed error information
+    assert len(result.observations) == 1
+    assert result.observations[0]["role"] == "environment"
+    content = result.observations[0]["content"]
+    assert "Turn 1 failed" in content
+    assert ("Compilation/Runtime Error:" in content or "error" in content.lower())
+    
+    # Should get 0 reward for syntax error
+    assert result.rewards[0] == 0.0
+    
+    # Should not terminate on error (allow retry)
+    assert result.terminateds[0] == False
+    
+    # Metadata should be updated for next turn
+    assert result.metadata[0] is not None
+    assert result.metadata[0]["current_turn"] == 1
+
+
+def test_multi_turn_turn_penalty_calculation(code_env):
+    """Test that turn penalties are calculated correctly for different turns."""
+    # Test data for third turn (should have penalty of 0.8^2 = 0.64)
+    message_log_batch = [
+        [
+            {
+                "role": "user",
+                "content": "Write a function that adds two numbers.",
+            },
+            {
+                "role": "assistant",
+                "content": """```python
+def add_numbers(a, b):
+    return a + b
+```""",
+            },
+        ]
+    ]
+    metadata = [
+        {
+            "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+            "fn_name": "add_numbers",
+            "current_turn": 2,  # Third turn (0-indexed)
+        }
+    ]
+
+    result = ray.get(code_env.step.remote(message_log_batch, metadata))
+
+    # Should succeed with penalty for third turn
+    expected_reward = 1.0 * (0.8 ** 2)  # 0.64
+    assert abs(result.rewards[0] - expected_reward) < 1e-6
+    assert result.terminateds[0] == True
+
+
+def test_multi_turn_batch_processing(code_env):
+    """Test multi-turn functionality with batch processing."""
+    # Mix of different turn states
+    message_log_batch = [
+        [
+            {
+                "role": "user",
+                "content": "Write a function that adds two numbers.",
+            },
+            {
+                "role": "assistant",
+                "content": """```python
+def add_numbers(a, b):
+    return a + b
+```""",
+            },
+        ],
+        [
+            {
+                "role": "user",
+                "content": "Write a function that multiplies two numbers.",
+            },
+            {
+                "role": "assistant",
+                "content": """```python
+def multiply_numbers(a, b):
+    return a + b  # Wrong operation
+```""",
+            },
+        ],
+    ]
+    metadata = [
+        {
+            "unittests": [{"inputs": "2\n3", "outputs": "5"}],
+            "fn_name": "add_numbers",
+            "current_turn": 0,  # First turn - should succeed
+        },
+        {
+            "unittests": [{"inputs": "3\n4", "outputs": "12"}],
+            "fn_name": "multiply_numbers",
+            "current_turn": 1,  # Second turn - should fail but continue
+        },
+    ]
+
+    result = ray.get(code_env.step.remote(message_log_batch, metadata))
+
+    # First item should succeed on first turn
+    assert result.rewards[0] == 1.0  # No penalty for first turn
+    assert result.terminateds[0] == True
+    assert result.metadata[0] is None
+
+    # Second item should fail on second turn
+    assert result.rewards[1] == 0.0
+    assert result.terminateds[1] == False
+    assert result.metadata[1] is not None
+    assert result.metadata[1]["current_turn"] == 2

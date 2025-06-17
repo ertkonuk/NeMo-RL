@@ -141,25 +141,10 @@ class CodeEnvironment(EnvironmentInterface):
                 - Tensor: Rewards tensor
                 - Tensor: Done flags tensor
         """
-        # Process each turn in the batch
-        results = [
-            self.runner.process_turn(log, meta)
-            for log, meta in zip(message_log_batch, metadata)
-        ]
-
-        # Unpack results and format according to EnvironmentReturn NamedTuple
-        observations = []
-        rewards = []
-        terminateds = []
-        all_stop_strings = []
-        all_next_metadata = []
-
-        for obs, rew, term, stops, meta in results:
-            observations.append(obs)
-            rewards.append(rew)
-            terminateds.append(term)
-            all_stop_strings.append(stops)
-            all_next_metadata.append(meta)
+        # Use batch processing instead of individual processing
+        observations, rewards, terminateds, all_stop_strings, all_next_metadata = self.runner.process_turn(
+            message_log_batch, metadata
+        )
 
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
         terminated_tensor = torch.tensor(terminateds, dtype=torch.bool)
@@ -236,7 +221,7 @@ class CodeRunner:
         """Format detailed error feedback for the model."""
         # Only treat as correct if score > 0 AND no error metadata
         if score > 0 and (not execution_metadata or execution_metadata == {}):
-            return "<environment>\nYour solution is correct! Well done.\n</environment>"
+            return "<environment>\nThe solution is correct!\n</environment>"
         
         feedback_parts = [f"<environment>\nTurn {current_turn} failed."]
         
@@ -277,83 +262,92 @@ class CodeRunner:
 
     def process_turn(
         self,
-        message_log: LLMMessageLogType,
-        metadata: CodeEnvironmentMetadata,
+        message_log_batch: List[LLMMessageLogType],
+        metadata: List[CodeEnvironmentMetadata],
     ) -> Tuple[
-        Dict[str, str],
-        float,
-        bool,
-        Optional[List[str]],
-        Optional[CodeEnvironmentMetadata],
+        List[Dict[str, str]],  # observations
+        List[float],           # rewards
+        List[bool],            # terminateds
+        List[Optional[List[str]]], # stop_strings
+        List[Optional[CodeEnvironmentMetadata]], # next_metadata
     ]:
-        """Processes a single turn for the code environment."""
+        """Process a batch of turns with multi-turn support."""
         
-        # Check if we've exceeded max turns
-        current_turn = metadata.get("current_turn", 0) + 1
-        max_turns = self.max_turns
-        
-        if current_turn > max_turns:
-            return (
-                {"role": "environment", "content": "<environment>\nMaximum turns reached. Episode terminated.\n</environment>"},
-                0.0,
-                True,  # Terminate episode
-                None,
-                None,
+        # Extract the assistant's responses from the message history (same as original)
+        assistant_response_batch = []
+        for conversation in message_log_batch:
+            assistant_responses = [
+                interaction["content"]
+                for interaction in conversation
+                if interaction["role"] == "assistant"
+            ]
+            assistant_response_batch.append("".join(assistant_responses))
+
+        unittests = [prepare_tests(m) for m in metadata]
+
+        chunked_assistant_response_batch = chunk_list_to_workers(
+            assistant_response_batch, self.num_workers
+        )
+        chunked_unittests = chunk_list_to_workers(unittests, self.num_workers)
+
+        # Process each chunk in parallel (same as original)
+        futures = [
+            self.workers[i].verify.remote(chunk, unittests_chunk, self.timeout)
+            for i, (chunk, unittests_chunk) in enumerate(
+                zip(chunked_assistant_response_batch, chunked_unittests)
             )
-        
-        # Extract the assistant's response from the message history
-        assistant_responses = [
-            interaction["content"]
-            for interaction in message_log
-            if interaction["role"] == "assistant"
         ]
-        assistant_response = "".join(assistant_responses)
+
+        results = ray.get(futures)
+
+        # flatten the results (same as original)
+        results = [item for sublist in results for item in sublist]
         
-        if not assistant_response.strip():
-            return (
-                {"role": "environment", "content": "<environment>\nNo code provided. Please provide a solution.\n</environment>"},
-                0.0,
-                False,
-                None,
-                metadata,
-            )
+        # Process results with multi-turn logic
+        observations = []
+        rewards = []
+        terminateds = []
+        next_metadata = []
         
-        # Prepare the test case
-        unittest_data = prepare_tests(metadata)
-        
-        # Run verification
-        try:
-            score, execution_metadata = ray.get(
-                self.workers[0].verify.remote([assistant_response], [unittest_data], self.timeout)
-            )[0]
-        except Exception as e:
-            execution_metadata = {
-                "error": str(e),
-                "error_type": type(e).__name__,
-            }
-            score = 0.0
-        
-        # Apply turn-based reward multiplier if solution is correct
-        if score > 0:
-            # Apply penalty for each turn beyond the first
-            # Turn 1: multiplier = 1.0, Turn 2: multiplier = 0.8, Turn 3: multiplier = 0.64, etc.
-            turn_multiplier = self.turn_penalty ** (current_turn - 1)
-            score = score * turn_multiplier
-        
-        # Create feedback
-        feedback = self._format_error_feedback(execution_metadata, current_turn, score)
-        observation = {"role": "environment", "content": feedback}
-        
-        # Determine if episode should terminate
-        is_correct = score > 0
-        is_terminated = is_correct
-        
-        # Update metadata for next turn
-        if not is_terminated:
-            new_metadata = metadata.copy()
-            new_metadata["current_turn"] = current_turn
+        for i, (score, execution_metadata) in enumerate(results):
+            current_turn = metadata[i].get("current_turn", 0) + 1
             
-            return (observation, score, is_terminated, None, new_metadata)
-        else:
-            # Episode terminated successfully
-            return (observation, score, is_terminated, None, None)
+            # Check max turns
+            if current_turn > self.max_turns:
+                observations.append({
+                    "role": "environment",
+                    "content": "<environment>\nMaximum turns reached. Episode terminated.\n</environment>"
+                })
+                rewards.append(0.0)
+                terminateds.append(True)
+                next_metadata.append(None)
+                continue
+            
+            # Apply turn-based reward multiplier if solution is correct
+            if score > 0:
+                # Apply penalty for each turn beyond the first
+                turn_multiplier = self.turn_penalty ** (current_turn - 1)
+                score = score * turn_multiplier
+            
+            # Create feedback
+            feedback = self._format_error_feedback(execution_metadata, current_turn, score)
+            observations.append({"role": "environment", "content": feedback})
+            
+            # Determine if episode should terminate
+            is_correct = score > 0
+            is_terminated = is_correct
+            
+            rewards.append(score)
+            terminateds.append(is_terminated)
+            
+            if not is_terminated:
+                # Update metadata for next turn
+                new_metadata = metadata[i].copy()
+                new_metadata["current_turn"] = current_turn
+                next_metadata.append(new_metadata)
+            else:
+                next_metadata.append(None)
+
+        next_stop_strings = [None] * len(message_log_batch)
+
+        return observations, rewards, terminateds, next_stop_strings, next_metadata
