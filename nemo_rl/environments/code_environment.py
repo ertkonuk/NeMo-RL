@@ -216,7 +216,7 @@ class CodeRunner:
         self.timeout = cfg["timeout"]
         self.max_turns = cfg["max_turns"]
         self.turn_penalty = cfg.get("turn_penalty", 0.8)  # Default to 0.8 if not specified
-        self.role = cfg.get("role", "user")  # Default to "user" if not specified
+        self.role = cfg.get("role", "environment")  # Default to "environment" if not specified
         self.num_workers = len(workers)
 
     def _format_error_feedback(self, execution_metadata: Dict, current_turn: int, score: float, use_env_tags: bool = False) -> str:

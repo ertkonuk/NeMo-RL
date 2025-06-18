@@ -414,7 +414,7 @@ def run_multi_turn_rollout(
                 sample_truncated[active_indices[i]] = True
 
             tokenized_env_obs_message = {
-                "role": env_output.observations[i]["role"],
+                "role": "environment",  # Always use "environment" role for validation compatibility
                 "content": env_obs_content,
                 "token_ids": tokenized_obs,
             }
