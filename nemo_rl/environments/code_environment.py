@@ -33,6 +33,7 @@ from nemo_rl.data.interfaces import LLMMessageLogType
 
 class CodeEnvConfig(TypedDict):
     num_workers: int
+    role: str = "environment"  # Can be "user" or "environment" 
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
     timeout: int = 10  # Timeout for the code execution
     max_turns: int = 3  # Maximum turns allowed per episode
@@ -215,15 +216,16 @@ class CodeRunner:
         self.timeout = cfg["timeout"]
         self.max_turns = cfg["max_turns"]
         self.turn_penalty = cfg.get("turn_penalty", 0.8)  # Default to 0.8 if not specified
+        self.role = cfg.get("role", "user")  # Default to "user" if not specified
         self.num_workers = len(workers)
 
-    def _format_error_feedback(self, execution_metadata: Dict, current_turn: int, score: float) -> str:
+    def _format_error_feedback(self, execution_metadata: Dict, current_turn: int, score: float, use_env_tags: bool = False) -> str:
         """Format detailed error feedback for the model."""
         # Only treat as correct if score > 0 AND no error metadata
         if score > 0 and (not execution_metadata or execution_metadata == {}):
-            return "<environment>\nThe solution is correct!\n</environment>"
+            return "The solution is correct!"
         
-        feedback_parts = [f"<environment>\nTurn {current_turn} failed."]
+        feedback_parts = [f"Your solution is incorrect."]
         
         # Handle compilation errors
         if "error" in execution_metadata:
@@ -256,7 +258,6 @@ class CodeRunner:
                     
         # Add general guidance
         feedback_parts.append(f"\nPlease analyze the feedback and fix your code.")
-        feedback_parts.append("</environment>")
         
         return "\n".join(feedback_parts)
 
@@ -314,9 +315,13 @@ class CodeRunner:
             
             # Check max turns
             if current_turn > self.max_turns:
+                content = "Maximum turns reached. Episode terminated."
+                if self.role != "user":
+                    content = f"<environment>\n{content}\n</environment>"
+                
                 observations.append({
-                    "role": "environment",
-                    "content": "<environment>\nMaximum turns reached. Episode terminated.\n</environment>"
+                    "role": self.role,
+                    "content": content
                 })
                 rewards.append(0.0)
                 terminateds.append(True)
@@ -331,7 +336,10 @@ class CodeRunner:
             
             # Create feedback
             feedback = self._format_error_feedback(execution_metadata, current_turn, score)
-            observations.append({"role": "environment", "content": feedback})
+            if self.role != "user":
+                feedback = f"<environment>\n{feedback}\n</environment>"
+            
+            observations.append({"role": self.role, "content": feedback})
             
             # Determine if episode should terminate
             is_correct = score > 0

@@ -349,11 +349,56 @@ def run_multi_turn_rollout(
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
-            # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0]
+            
+            # For user role messages, apply chat template by appending to existing conversation
+            if env_output.observations[i]["role"] == "user":
+                # Get the existing conversation from the message log
+                existing_conversation = get_keys_from_message_log(
+                    current_batch["message_log"][global_idx], ["role", "content"]
+                )
+                # Append the new user message
+                full_conversation = existing_conversation + [{"role": "user", "content": env_obs_content}]
+                
+                # Apply chat template to the full conversation
+                full_tokenized = tokenizer.apply_chat_template(
+                    full_conversation,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )[0]
+                
+                # Get tokens for existing conversation to subtract
+                existing_tokenized = tokenizer.apply_chat_template(
+                    existing_conversation,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )[0]
+                
+                # Extract only the new user message tokens
+                tokenized_obs = full_tokenized[len(existing_tokenized):]
+                
+                # Update env_obs_content to match what the tokens represent (formatted with chat template)
+                full_text = tokenizer.apply_chat_template(
+                    full_conversation,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    add_special_tokens=False,
+                )
+                existing_text = tokenizer.apply_chat_template(
+                    existing_conversation,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    add_special_tokens=False,
+                )
+                env_obs_content = full_text[len(existing_text):]
+            else:
+                # Tokenize the raw content from the environment for non-user roles
+                tokenized_obs = tokenizer(
+                    env_obs_content, return_tensors="pt", add_special_tokens=False
+                )["input_ids"][0]
 
             # check if new message overflows max_seq_len
             if (

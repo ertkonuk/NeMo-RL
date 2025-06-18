@@ -29,7 +29,7 @@ def code_env():
             "py_executable": CodeEnvironment.DEFAULT_PY_EXECUTABLE,
             "env_vars": dict(os.environ),
         }
-    ).remote({"num_workers": 2, "timeout": 10, "max_turns": 3, "turn_penalty": 0.8})
+    ).remote({"num_workers": 2, "timeout": 10, "max_turns": 3, "turn_penalty": 0.8, "role": "environment"})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()

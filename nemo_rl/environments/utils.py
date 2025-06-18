@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Any, List
-
+import re
 
 def chunk_list_to_workers(to_chunk: List[Any], num_workers: int) -> List[List[Any]]:
     """Chunk a list into a list of lists, where each sublist is assigned to a worker. Keeps ordering of elements.
@@ -98,10 +98,28 @@ def extract_answer_from_box(string):
 
     return None
 
+# Taken from: https://github.com/ScalingIntelligence/KernelBench/blob/main/src/utils.py#L478
+def extract_code(output_string: str, code_language_types: list[str] = ["python"]) -> str:
+    """
+    Extract first code block from model output, specified by code_language_type
+    COMPLETE extraction from KernelBench utils.py - no changes
+    """
+    trimmed = output_string.strip()
 
-def extract_code(text: str) -> str:
-    outputlines = text.split("\n")
-    indexlines = [i for i, line in enumerate(outputlines) if "```" in line]
-    if len(indexlines) < 2:
-        return ""
-    return "\n".join(outputlines[indexlines[-2] + 1 : indexlines[-1]])
+    # Extracting the first occurrence of content between backticks
+    code_match = re.search(r"```(.*?)```", trimmed, re.DOTALL)
+
+    if code_match:
+        # Strip leading and trailing whitespace from the extracted code
+        code = code_match.group(1).strip()
+
+        # depends on code_language_type: cpp, python, etc.
+        # sometimes the block of code is ```cpp ... ``` instead of ``` ... ```
+        # in this case strip the cpp out
+        for code_type in code_language_types:
+            if code.startswith(code_type):
+                code = code[len(code_type) :].strip()
+
+        return code
+
+    return None
