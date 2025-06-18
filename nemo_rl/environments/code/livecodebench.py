@@ -28,11 +28,14 @@ def _temp_run(sample, generation, debug, result, metadata_list, timeout):
             )
             result.append(res)
             metadata_list.append(metadata)
-        except Exception:
-            # print(e) # some tracebacks are extremely long.
-            traceback.print_exc(10)
+        except Exception as e:
+            error_traceback = traceback.format_exc(limit=10)
+            error_metadata = {
+                "error": str(e),
+                "traceback": error_traceback,
+            }
             result.append([-1 for i in range(len(sample["inputs"]))])
-            metadata_list.append({})
+            metadata_list.append(error_metadata)
 
 
 def check_correctness(in_outs: Optional[dict], generation, timeout=10, debug=True):
@@ -58,6 +61,13 @@ def check_correctness(in_outs: Optional[dict], generation, timeout=10, debug=Tru
         result = [[-1 for i in range(len(in_outs["inputs"]))]]
         if debug:
             print("global timeout")
+        # Add timeout metadata consistent with code_environment format
+        timeout_metadata = [{
+            "error": "Global timeout exceeded",
+            "error_message": "Timeout Error",
+            "timeout_seconds": (timeout + 1) * len(in_outs["inputs"]) + 5,
+        }]
+        return result[0], timeout_metadata
     return result[0], metadata_list
 
 
@@ -82,7 +92,12 @@ def compute_score(solution, test_cases, timeout=5, debug=False, continuous=False
             if metadata and len(metadata) > 0:
                 first_metadata = metadata[0]  # Get first metadata entry
             else:
-                first_metadata = {}
+                # Provide more informative metadata when none is available
+                first_metadata = {
+                    "error": "No detailed error information available",
+                    "error_message": "Unknown Error", 
+                    "debug_info": f"Results: {res}, Metadata length: {len(metadata) if metadata else 0}"
+                }
                 
             success = all(map(lambda x: x is True, res))
             # Always return the metadata whether success or failure

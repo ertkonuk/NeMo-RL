@@ -274,15 +274,16 @@ class CodeRunner:
     ]:
         """Process a batch of turns with multi-turn support."""
         
-        # Extract the assistant's responses from the message history (same as original)
+        # Extract the assistant's responses from the message history
         assistant_response_batch = []
         for conversation in message_log_batch:
-            assistant_responses = [
-                interaction["content"]
-                for interaction in conversation
-                if interaction["role"] == "assistant"
-            ]
-            assistant_response_batch.append("".join(assistant_responses))
+            # Find the last response from the assistant in the conversation log
+            last_assistant_response = ""
+            for interaction in reversed(conversation):
+                if interaction["role"] == "assistant":
+                    last_assistant_response = interaction["content"]
+                    break
+            assistant_response_batch.append(last_assistant_response)
 
         unittests = [prepare_tests(m) for m in metadata]
 
