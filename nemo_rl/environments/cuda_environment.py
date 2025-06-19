@@ -42,14 +42,11 @@ class CudaEnvConfig(TypedDict):
 
     # Misc environmentsettings
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
-    verbose: Optional[bool]  # Verbose compilation and execution logging
+    verbose: Optional[bool] = True # Verbose compilation and execution logging
 
 
 class CudaEnvironmentMetadata(TypedDict):
     reference_implementation: str  # Original PyTorch model source code
-    num_correctness_trials: Optional[int]  # Override default number of trials
-    measure_performance: Optional[bool]  # Override default performance measurement
-    reference_baseline_time: Optional[float]  # Reference implementation timing
 
 def prepare_cuda_build_info(metadata, conversation_content, sample_index):
     """Preprocess metadata to add unique build directory info."""
@@ -221,19 +218,15 @@ class CudaVerifyWorker:
                         print(f"Worker {self.worker_id}: Compilation failed for sample {i}: {error_msg}")
                     results.append(0.0)
                     continue
-
-                # Phase 2: GPU execution and verification
-                num_trials = metadata_item.get("num_correctness_trials", num_correctness_trials)
-                measure_perf = metadata_item.get("measure_performance", measure_performance)
                 
                 kernel_result = self.verify_func(
                     original_model_src=reference_src,
                     custom_model_src=cuda_code,
                     seed_num=42,
-                    num_correct_trials=num_trials,
+                    num_correct_trials=num_correctness_trials,
                     num_perf_trials=num_performance_trials,
                     verbose=self.verbose,
-                    measure_performance=measure_perf,
+                    measure_performance=measure_performance,
                     build_dir=build_dir,
                     device=self.device,
                 )
@@ -292,10 +285,9 @@ class CudaEnvironment(EnvironmentInterface):
         self.num_workers = cfg["num_workers"]
         self.cuda_build_cache = cfg["cuda_build_cache"]
         
-        # Set up GPU architecture if specified
-        if cfg.get("gpu_arch"):
-            from nemo_rl.environments.cuda.cuda_utils import set_gpu_arch
-            set_gpu_arch(cfg["gpu_arch"])
+        # Set up GPU architecture (default to Hopper)
+        from nemo_rl.environments.cuda.cuda_utils import set_gpu_arch
+        set_gpu_arch(cfg.get("gpu_arch", "Hopper"))
         
         # Determine GPU assignments
         if cfg.get("cuda_device_ids"):

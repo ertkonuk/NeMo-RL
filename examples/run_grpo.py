@@ -28,6 +28,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.code_environment import CodeEnvironment
+from nemo_rl.environments.cuda_environment import CudaEnvironment
 from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
 from nemo_rl.environments.math_environment import MathEnvironment
@@ -175,6 +176,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
             }
         ).remote(env_configs["code"])
         task_to_env["code"] = code_env
+
+    if "cuda" in env_configs and env_configs["cuda"]["enable"]:
+        cuda_env = CudaEnvironment.options(
+            runtime_env={
+                "py_executable": CudaEnvironment.DEFAULT_PY_EXECUTABLE,
+                "env_vars": dict(os.environ),
+            }
+        ).remote(env_configs["cuda"])
+        task_to_env["cuda"] = cuda_env
 
     if "llm_judge_async" in env_configs and env_configs["llm_judge_async"]["enable"]:
         # Extract max_concurrency from config, default to 16 if not specified

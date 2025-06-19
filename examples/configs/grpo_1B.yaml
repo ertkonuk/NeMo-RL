@@ -150,6 +150,19 @@ env:
   ifeval:
     num_workers: 8
     enable: false
+  cuda:
+    num_workers: 8
+    enable: false
+    timeout: 10 # Timeout for individual kernel verification
+    compilation_timeout: 10 # Separate timeout for compilation phase
+    gpu_memory_fraction: 0.05 # GPU memory fraction per worker
+    cuda_build_cache: "cuda_build_cache" 
+    measure_performance: false # Whether to benchmark correct kernels
+    num_correctness_trials: 1 # Number of correctness trials per kernel
+    num_performance_trials: 10 # Number of performance trials per kernel
+    max_concurrent_compilations: 10 # Limit concurrent compilations
+    gpu_arch: "Hopper" # CUDA architecture (e.g., "Hopper", "Ampere", "Ada")
+    cuda_device_ids: null # Specific CUDA devices to use; null: Automatically detect the available GPUs
 
 logger:
   log_dir: "logs"  # Base directory for all logs
