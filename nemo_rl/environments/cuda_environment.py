@@ -2,7 +2,6 @@ import logging
 import os
 import ray
 import shutil
-import torch
 import time
 import hashlib
 from typing import Dict, List, Optional, Tuple, TypedDict
@@ -21,6 +20,16 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 from nemo_rl.environments.cuda.cuda_verifier import eval_kernel_against_ref, check_metadata_serializable_all_types
 from nemo_rl.environments.cuda.cuda_model_loader import build_compile_cache
 from nemo_rl.environments.cuda.cuda_utils import extract_first_code, extract_last_code
+
+# Ray scheduling helpers
+from ray.util.scheduling_strategies import (
+    PlacementGroupSchedulingStrategy,
+)
+
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+
+# Torch is needed for CPU-side tensor ops in the env actor; GPU workers re-import it after Ray sets CVD
+import torch
 
 class CudaEnvConfig(TypedDict):
     # Core Ray/Cluster settings
@@ -66,14 +75,12 @@ def prepare_cuda_build_info(metadata, conversation_content, sample_index):
 class CudaVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.CUDA
 
-    def __init__(self, 
+    def __init__(self,
                  worker_id: int,
-                 gpu_id: int,
                  cuda_build_cache: str,
                  verbose: bool = True,
                  gpu_memory_fraction: Optional[float] = None):
         self.worker_id = worker_id
-        self.gpu_id = gpu_id
         self.verbose = verbose
         
         logging.getLogger("cuda_verify").setLevel(
@@ -92,44 +99,34 @@ class CudaVerifyWorker:
         if self.verbose:
             print(f"Worker {worker_id} CUDA_VISIBLE_DEVICES before: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         
-        # FORCE set CUDA_VISIBLE_DEVICES to only this worker's assigned GPU
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        
-        if self.verbose:
-            print(f"Worker {worker_id} CUDA_VISIBLE_DEVICES after: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-            print(f"Worker {worker_id} torch.cuda.is_available(): {torch.cuda.is_available()}")
-            print(f"Worker {worker_id} torch.cuda.device_count(): {torch.cuda.device_count()}")
-        
-        # Set up CUDA device (since worker only sees one GPU, use device 0)
+        # Import torch *after* Ray has set CUDA_VISIBLE_DEVICES automatically.
+        import torch  # pylint: disable=import-error,import-outside-toplevel
+
+        # Ray exposes exactly one GPU, so cuda:0 is always correct.
         self.device = torch.device("cuda:0")
-        
-        # Verify CUDA is available before setting device
+
+        # Sanity-check CUDA availability (should always be True now)
         if not torch.cuda.is_available():
-            raise RuntimeError(f"Worker {worker_id}: CUDA is not available in Ray worker")
-        
-        device_count = torch.cuda.device_count()
-        if device_count == 0:
-            raise RuntimeError(f"Worker {worker_id}: No CUDA devices visible (assigned GPU {gpu_id})")
-        
+            raise RuntimeError(
+                f"Worker {worker_id}: CUDA unavailable despite Ray allocating a GPU."
+            )
+
         if self.verbose:
-            print(f"Worker {worker_id} attempting to set device to cuda:0 (physical GPU {gpu_id})")
+            print(
+                f"Worker {worker_id}: torch.cuda.device_count() = {torch.cuda.device_count()}"
+            )
         
-        # Set the device
-        torch.cuda.set_device(self.device)
-        
-        # Test if we can actually use the device
+        # Test device usability
         try:
-            test_tensor = torch.tensor([1.0], device=self.device)
-            test_tensor.cpu()  # This will fail if device is not accessible
-            if self.verbose:
-                print(f"Worker {worker_id} successfully created tensor on GPU {gpu_id}")
+            _ = torch.tensor([1.0], device=self.device).cpu()
         except Exception as e:
-            raise RuntimeError(f"Worker {worker_id}: Cannot create tensor on GPU {gpu_id}: {e}") from e
+            raise RuntimeError(
+                f"Worker {worker_id}: Failed to allocate tensor on CUDA device: {e}"
+            ) from e
         
         # Set GPU memory fraction if specified
-        if gpu_memory_fraction is not None:
-            if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
-                torch.cuda.set_per_process_memory_fraction(gpu_memory_fraction, device=0)
+        if gpu_memory_fraction is not None and hasattr(torch.cuda, "set_per_process_memory_fraction"):
+            torch.cuda.set_per_process_memory_fraction(gpu_memory_fraction, device=0)
         
         # Import verification functions
         self.verify_func = eval_kernel_against_ref
@@ -263,13 +260,15 @@ class CudaVerifyWorker:
 
     def get_worker_stats(self) -> Dict:
         """Get worker statistics and GPU memory usage."""
+        import torch  # pylint: disable=import-error,import-outside-toplevel
+
         with torch.cuda.device(self.device):
             memory_allocated = torch.cuda.memory_allocated(self.device)
             memory_reserved = torch.cuda.memory_reserved(self.device)
             
         return {
             "worker_id": self.worker_id,
-            "gpu_id": self.gpu_id,
+            "gpu_id": os.environ.get("CUDA_VISIBLE_DEVICES", "unknown"),
             "device": str(self.device),
             "memory_allocated_mb": memory_allocated / (1024 * 1024),
             "memory_reserved_mb": memory_reserved / (1024 * 1024),
@@ -289,51 +288,56 @@ class CudaEnvironment(EnvironmentInterface):
         from nemo_rl.environments.cuda.cuda_utils import set_gpu_arch
         set_gpu_arch(cfg.get("gpu_arch", "Hopper"))
         
-        # Determine GPU assignments
-        if cfg.get("cuda_device_ids"):
-            available_gpus = cfg["cuda_device_ids"]
-        else:
-            # Try to detect available CUDA devices
-            if torch.cuda.is_available():
-                device_count = torch.cuda.device_count()
-                if device_count > 0:
-                    available_gpus = list(range(device_count))
-                else:
-                    # Fallback: assume at least device 0 if CUDA is available
-                    available_gpus = [0]
-            else:
-                available_gpus = []
+        # ---- Create placement group for single-GPU verify workers (following llm_judge pattern) ----
+        # Since each worker needs exactly 1 GPU (like tensor_parallel_size=1), we use placement group
+        bundle_ct_per_node_list = [1] * self.num_workers  # One 1-GPU bundle per worker
         
-        if not available_gpus:
-            raise RuntimeError("No CUDA devices available for CudaEnvironment")
-        
-        # Log GPU assignment info if verbose
+        self.verify_vc = RayVirtualCluster(
+            bundle_ct_per_node_list=bundle_ct_per_node_list,
+            use_gpus=True,
+            name="cuda_verify_vc",
+        )
         if cfg.get("verbose", False):
-            print(f"CudaEnvironment: Creating {self.num_workers} workers across {len(available_gpus)} GPUs")
-            print(f"Available GPU IDs: {available_gpus}")
-        
-        # Create workers with GPU assignment (round-robin)
+            self.verify_vc.print_cluster_grid()
+        placement_groups = self.verify_vc.get_placement_groups()
+
+        # Set up worker scheduling strategy
+        if self.verify_vc is not None:
+            placement_group = self.verify_vc.get_placement_groups()[0]
+            scheduling_kwargs = {
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group
+                ),
+            }
+        else:
+            # No placement group - let Ray handle scheduling
+            scheduling_kwargs = {}
+
+        worker_runtime_env = {
+            "py_executable": CudaVerifyWorker.DEFAULT_PY_EXECUTABLE,
+            "env_vars": {
+                "TORCH_USE_CUDA_DSA": "1",
+            },
+        }
+
         self.workers = []
         for i in range(self.num_workers):
-            gpu_id = available_gpus[i % len(available_gpus)]
-            
-            if cfg.get("verbose", False):
-                print(f"Worker {i} -> GPU {gpu_id}")
+            # Single-GPU workers always use placement group (like llm_judge tensor_parallel_size=1)
+            pg_index = i % len(placement_groups)
+            pg = placement_groups[pg_index]
+            scheduling_kwargs = {
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(placement_group=pg)
+            }
             
             worker = CudaVerifyWorker.options(
-                num_gpus=1,  # Each worker requests 1 GPU from Ray
-                runtime_env={
-                    "py_executable": CudaVerifyWorker.DEFAULT_PY_EXECUTABLE,
-                    "env_vars": {
-                        "TORCH_USE_CUDA_DSA": "1",  # Enable device-side assertions
-                    }
-                }
+                num_gpus=1,
+                runtime_env=worker_runtime_env,
+                **scheduling_kwargs,
             ).remote(
                 worker_id=i,
-                gpu_id=gpu_id,
                 cuda_build_cache=self.cuda_build_cache,
                 verbose=cfg.get("verbose", False),
-                gpu_memory_fraction=cfg.get("gpu_memory_fraction")
+                gpu_memory_fraction=cfg.get("gpu_memory_fraction"),
             )
             self.workers.append(worker)
 
@@ -344,6 +348,9 @@ class CudaEnvironment(EnvironmentInterface):
         """Shutdown all CUDA workers."""
         for worker in self.workers:
             ray.kill(worker)
+        # Release placement-group resources
+        if hasattr(self, "verify_vc") and self.verify_vc is not None:
+            self.verify_vc.shutdown()
 
     def step(
         self,
@@ -404,6 +411,7 @@ class CudaEnvironment(EnvironmentInterface):
 
         # flatten the results
         results = [item for sublist in results for item in sublist]
+        
         observations = [
             {
                 "role": "environment",
@@ -436,6 +444,7 @@ class CudaEnvironment(EnvironmentInterface):
         Every rank will run this function, so you're free to use distributed
         calculations if you'd prefer for heavy metrics.
         """
+        import torch  # pylint: disable=import-error,import-outside-toplevel
         batch["rewards"] = (
             batch["rewards"] * batch["is_end"]
         )  # set a reward of 0 for any incorrectly ended sequences
