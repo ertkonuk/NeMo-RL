@@ -235,11 +235,23 @@ class CudaVerifyWorker:
                     results.append(0.0)  # Could implement retry logic here
                     continue
 
-                # Convert result to reward
+                # --------------------------------------------------------------
+                # Convert verification result into a scalar reward
+                # --------------------------------------------------------------
                 if kernel_result.compiled and kernel_result.correctness:
-                    results.append(1.0)
+                    reward_val = 1.0  # default for correctness only
+
+                    if measure_performance:
+                        # Use speed-up over baseline as reward when available
+                        speedup = kernel_result.metadata.get("speedup")
+                        if speedup is not None and isinstance(speedup, (int, float)) and speedup > 0:
+                            reward_val = float(speedup)
+
+                    results.append(reward_val)
                     if self.verbose:
-                        print(f"Worker {self.worker_id}: Sample {i} PASSED verification")
+                        print(
+                            f"Worker {self.worker_id}: Sample {i} PASSED verification | Reward = {reward_val:.4f}"
+                        )
                 else:
                     results.append(0.0)
                     if self.verbose:

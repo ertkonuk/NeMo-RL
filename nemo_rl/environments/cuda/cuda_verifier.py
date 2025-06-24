@@ -8,6 +8,7 @@ import json
 import statistics
 from typing import Dict, List, Optional, NamedTuple
 from pydantic import BaseModel
+import hashlib
 
 from nemo_rl.environments.cuda.cuda_model_loader import (
     load_original_model_and_inputs, load_custom_model, graceful_eval_cleanup, set_seed
@@ -24,6 +25,12 @@ class KernelExecResult(BaseModel):
     metadata: dict = {}
     runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     runtime_stats: dict = {}  # only recorded if we decide to measure performance
+
+# Module-level cache to store reference runtimes (in ms) keyed by a stable hash of the
+# reference implementation source.  This avoids re-timing the same reference model on
+# every call and keeps the function completely stateless with respect to the calling
+# object.
+_BASELINE_CACHE: dict[str, float] = {}
 
 def register_and_format_exception(
     exception_type: str,
@@ -466,6 +473,59 @@ def eval_kernel_against_ref(
                     print(f"[Eval] Performance Stats: {runtime_stats}")
                 kernel_exec_result.runtime = runtime_stats["mean"]
                 kernel_exec_result.runtime_stats = runtime_stats
+
+                # ------------------------------------------------------------------
+                # Measure (or fetch cached) baseline time for the reference model
+                # ------------------------------------------------------------------
+
+                # Use md5 of the reference source as a stable cache key
+                ref_key = hashlib.md5(original_model_src.encode()).hexdigest()
+
+                baseline_ms = _BASELINE_CACHE.get(ref_key)
+
+                if baseline_ms is None:
+                    if verbose:
+                        print("[Eval] Measuring Baseline Performance (reference model)")
+
+                    try:
+                        # Instantiate reference model on the current device
+                        model_ref = original_model.cuda(device=device)
+                        torch.cuda.synchronize(device=device)
+
+                        elapsed_ref = time_execution_with_cuda_event(
+                            model_ref,
+                            *inputs,
+                            num_trials=num_perf_trials,
+                            verbose=verbose,
+                            device=device,
+                        )
+
+                        baseline_stats = get_timing_stats(elapsed_ref, device=device)
+                        baseline_ms = baseline_stats["mean"]
+
+                        # Cache for future calls
+                        _BASELINE_CACHE[ref_key] = baseline_ms
+
+                        if verbose:
+                            print(f"[Eval] Baseline mean latency: {baseline_ms:.4f} ms")
+                    except torch.cuda.OutOfMemoryError as oom:
+                        if verbose:
+                            print(f"[Eval] OOM during baseline measurement: {oom}")
+                        baseline_ms = None
+                    finally:
+                        # Explicitly delete model to free GPU memory
+                        if 'model_ref' in locals():
+                            del model_ref
+                        torch.cuda.empty_cache()
+
+                # Compute speed-up and store in metadata for downstream use
+                if baseline_ms and kernel_exec_result.runtime > 0:
+                    speedup = baseline_ms / kernel_exec_result.runtime
+                    kernel_exec_result.metadata["baseline_ms"] = baseline_ms
+                    kernel_exec_result.metadata["speedup"] = speedup
+                else:
+                    kernel_exec_result.metadata["baseline_ms"] = baseline_ms or -1.0
+                    kernel_exec_result.metadata.setdefault("speedup", -1.0)
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
